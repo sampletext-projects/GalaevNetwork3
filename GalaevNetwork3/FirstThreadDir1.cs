@@ -1,0 +1,261 @@
+﻿using System.Collections;
+using System.IO;
+using System.Text;
+using System.Threading;
+using GalaevNetwork3.BitArrayRoutine;
+
+namespace GalaevNetwork3
+{
+    public class FirstThreadDir1
+    {
+        private Semaphore _sendSemaphore;
+        private Semaphore _receiveSemaphore;
+        private BitArray _sendMessage;
+        private BitArray _receivedMessage;
+        private PostToSecondWT _post;
+
+        public FirstThreadDir1(ref Semaphore sendSemaphore, ref Semaphore receiveSemaphore)
+        {
+            _sendSemaphore = sendSemaphore;
+            _receiveSemaphore = receiveSemaphore;
+        }
+
+        public void FirstThreadMain(object obj)
+        {
+            _post = (PostToSecondWT)obj;
+
+            // + Полудуплексный протокол (Confirmed by Zamanov https://yadi.sk/i/jBUw90I_pDuvcQ)
+            // + Передача последовательности кадров
+            // + Скользящее окно отсутствует
+            // + Нумерация кадров отсутствует
+            // + Запрос на соединение
+            // + Запрос на разъединение
+            // + Согласие на соединение
+            // + Согласие на разъединение
+            // + RR (Receiver Ready) - получатель готов принимать данные
+            // + RNR (Receiver Not Ready) - получатель не готов принимать данные
+            // + REJ (Reject) - получатель отверг принятые данные
+            // + Добавить шумы (инвертировать один рандомный бит)
+
+            ConsoleHelper.WriteToConsole("1 поток (1->2)", "Начинаю работу.");
+
+            if (!EstablishConnection()) return;
+            ConsoleHelper.WriteToConsole("1 поток (1->2)", "Подключен");
+            
+            SendFileChunk();
+
+            if (!Disconnect()) return;
+            ConsoleHelper.WriteToConsole("1 поток (1->2)", "Отключен");
+
+            ConsoleHelper.WriteToConsole("1 поток (1->2)", "Завершаю работу.");
+        }
+
+        private void SendFileChunk()
+        {
+            var dataBytes = File.ReadAllBytes("C:\\Users\\Admin\\Downloads\\data.txt");
+            var dataBitArray = new BitArray(dataBytes);
+
+            var inputBitArrays = dataBitArray.Split(C.MaxFrameDataSize);
+
+            ConsoleHelper.WriteToConsole("1 поток (1->2)", "Начало передачи");
+
+            bool acceptedStartFrame = false;
+
+            while (!acceptedStartFrame)
+            {
+                _sendMessage = BuildStartFrame().Build();
+                _post(_sendMessage);
+                _sendSemaphore.Release();
+                _receiveSemaphore.WaitOne();
+
+                var startResponseFrame = Frame.Parse(_receivedMessage);
+                if (startResponseFrame.Control.ToByteArray()[0] == (byte)ResponseStatus.RR)
+                {
+                    acceptedStartFrame = true;
+                }
+                else
+                {
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", "Кадр отвергнут");
+                }
+            }
+
+            for (int i = 0; i < inputBitArrays.Count; i++)
+            {
+                bool acceptedDataFrame = false;
+                while (!acceptedDataFrame)
+                {
+                    _sendMessage = BuildDataFrame(inputBitArrays[i]).Build();
+                    _post(_sendMessage);
+                    _sendSemaphore.Release();
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", $"Передан кадр {i}");
+                    _receiveSemaphore.WaitOne();
+                    
+                    var dataResponseFrame = Frame.Parse(_receivedMessage);
+                    if (dataResponseFrame.Control.ToByteArray()[0] == (byte)ResponseStatus.RR)
+                    {
+                        acceptedDataFrame = true;
+                    }
+                    else
+                    {
+                        ConsoleHelper.WriteToConsole("1 поток (1->2)", "Кадр отвергнут");
+                    }
+                }
+            }
+
+            ConsoleHelper.WriteToConsole("1 поток (1->2)", "Конец передачи");
+            
+            bool acceptedEndFrame = false;
+
+            while (!acceptedEndFrame)
+            {
+                _sendMessage = BuildEndFrame().Build();
+                _post(_sendMessage);
+                _sendSemaphore.Release();
+                _receiveSemaphore.WaitOne();
+
+                var endResponseFrame = Frame.Parse(_receivedMessage);
+                if (endResponseFrame.Control.ToByteArray()[0] == (byte)ResponseStatus.RR)
+                {
+                    acceptedEndFrame = true;
+                }
+                else
+                {
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", "Кадр отвергнут");
+                }
+            }
+        }
+
+        private bool EstablishConnection()
+        {
+            bool connected = false;
+            int tries = 0;
+            while (!connected && tries < 3)
+            {
+                tries++;
+                
+                _sendMessage = BuildConnectFrame().Build();
+                _post(_sendMessage);
+                _sendSemaphore.Release();
+
+                if (!WaitForResponseWithTimeout())
+                {
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", "Соединение не установлено");
+                    continue;
+                }
+
+                var connectResponseFrame = Frame.Parse(_receivedMessage);
+
+                if (connectResponseFrame.Control.ToByteArray()[0] == (byte)ResponseStatus.RR)
+                {
+                    connected = true;
+                }
+                else
+                {
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", $"Подключение отвергнуто {tries} раз");
+                }
+            }
+
+            return tries != 3;
+        }
+
+        private bool Disconnect()
+        {
+            bool disconnected = false;
+            int tries = 0;
+            while (!disconnected && tries < 3)
+            {
+                tries++;
+                
+                _sendMessage = BuildDisconnectFrame().Build();
+                _post(_sendMessage);
+                _sendSemaphore.Release();
+
+                if (!WaitForResponseWithTimeout())
+                {
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", "Ответ на отключение не получен");
+                    continue;
+                }
+
+                var disconnectResponseFrame = Frame.Parse(_receivedMessage);
+
+                if (disconnectResponseFrame.Control.ToByteArray()[0] == (byte)ResponseStatus.RR)
+                {
+                    disconnected = true;
+                }
+                else
+                {
+                    ConsoleHelper.WriteToConsole("1 поток (1->2)", $"Отключение отвергнуто {tries} раз");
+                }
+            }
+
+            return tries != 3;
+        }
+
+        private bool WaitForResponseWithTimeout()
+        {
+            int tries = 0;
+            while (!_receiveSemaphore.WaitOne(500) && tries < 3)
+            {
+                // Timeout
+                ConsoleHelper.WriteToConsole("1 поток (1->2)", $"Таймаут получения {++tries} раз");
+            }
+
+            return tries != 3;
+        }
+
+        private Frame BuildConnectFrame()
+        {
+            var frame = new Frame(new BitArray(C.ControlSize), new BitArray(0));
+
+            var bitArrayWriter = new BitArrayWriter(frame.Control);
+            bitArrayWriter.Write(new BitArray(new[] {(byte)RequestType.Connect, (byte)0}));
+
+            return frame;
+        }
+
+        private Frame BuildStartFrame()
+        {
+            var frame = new Frame(new BitArray(C.ControlSize), new BitArray(0));
+
+            var bitArrayWriter = new BitArrayWriter(frame.Control);
+            bitArrayWriter.Write(new BitArray(new[] {(byte)RequestType.Start, (byte)0}));
+
+            return frame;
+        }
+
+        private static Frame BuildDataFrame(BitArray data)
+        {
+            var frame = new Frame(new BitArray(C.ControlSize), data);
+
+            var bitArrayWriter = new BitArrayWriter(frame.Control);
+            bitArrayWriter.Write(new BitArray(new[] {(byte)RequestType.Data, (byte)0}));
+
+            return frame;
+        }
+
+        private static Frame BuildEndFrame()
+        {
+            var frame = new Frame(new BitArray(C.ControlSize), new BitArray(0));
+
+            var bitArrayWriter = new BitArrayWriter(frame.Control);
+            bitArrayWriter.Write(new BitArray(new[] {(byte)RequestType.End, (byte)0}));
+
+            return frame;
+        }
+
+        private Frame BuildDisconnectFrame()
+        {
+            var frame = new Frame(new BitArray(C.ControlSize), new BitArray(0));
+
+            var bitArrayWriter = new BitArrayWriter(frame.Control);
+            bitArrayWriter.Write(new BitArray(new[] {(byte)RequestType.Disconnect, (byte)0}));
+
+            return frame;
+        }
+
+        public void ReceiveData(BitArray array)
+        {
+            _receivedMessage = array;
+        }
+    }
+}
